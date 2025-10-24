@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Knights Meet - Video Conference</title>
+    <script src="/socket.io/socket.io.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; background-color: #333; color: #fff; }
+        #login-screen { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: #2c3e50; display: flex; flex-direction: column; justify-content: center; align-items: center; z-index: 100; }
+        #login-screen input { padding: 10px; margin: 8px 0; border: none; border-radius: 4px; width: 300px; }
+        #login-screen button { padding: 10px 20px; background-color: #2ecc71; color: white; border: none; border-radius: 4px; cursor: pointer; margin-top: 10px; }
+        #meeting-screen { display: none; height: 100vh; grid-template-columns: 3fr 1fr; }
+
+        /* Video Area */
+        #video-grid { display: grid; grid-gap: 10px; padding: 10px; background-color: #222; overflow-y: auto; height: calc(100vh - 70px); grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+        .video-container { position: relative; width: 100%; height: 100%; min-height: 200px; background-color: #000; border: 2px solid #555; border-radius: 8px; overflow: hidden; }
+        .video-container video { width: 100%; height: 100%; object-fit: cover; }
+        .name-tag { position: absolute; bottom: 5px; left: 5px; background: rgba(0, 0, 0, 0.6); padding: 3px 8px; border-radius: 3px; font-size: 0.9em; z-index: 2; }
+
+        /* Controls */
+        #controls { background-color: #1a1a1a; padding: 10px; display: flex; justify-content: center; gap: 15px; border-top: 2px solid #444; }
+        #controls button { padding: 8px 15px; background-color: #e74c3c; color: white; border: none; border-radius: 5px; cursor: pointer; transition: background-color 0.3s; }
+        #controls button.on { background-color: #3498db; }
+        
+        /* Sidebar (Chat & Participants) */
+        #sidebar { background-color: #1c1c1c; border-left: 2px solid #444; display: flex; flex-direction: column; }
+        #chat-section { flex-grow: 1; padding: 10px; overflow-y: auto; }
+        #chat-input-area { padding: 10px; border-top: 1px solid #444; display: flex; }
+        #chat-input-area input { flex-grow: 1; padding: 8px; border: none; border-radius: 4px 0 0 4px; }
+        #chat-input-area button { padding: 8px 15px; background-color: #f39c12; color: white; border: none; border-radius: 0 4px 4px 0; cursor: pointer; }
+        #participants-section { padding: 10px; border-top: 1px solid #444; }
+        #participants-list { list-style: none; padding: 0; }
+        #participants-list li { margin: 5px 0; display: flex; align-items: center; gap: 8px; font-size: 0.9em; }
+        .media-icon { width: 16px; height: 16px; }
+        
+    </style>
+</head>
+<body>
+
+    <div id="login-screen">
+        <h1>Knights Meet</h1>
+        <input type="text" id="meetingId" placeholder="Meeting ID" value="test-room">
+        <input type="password" id="meetingPassword" placeholder="Password (Optional)">
+        <input type="text" id="userName" placeholder="Your Name (Required)">
+        <button onclick="joinMeeting()">Join Meeting</button>
+        <p id="error-message" style="color: #e74c3c; margin-top: 10px;"></p>
+    </div>
+
+    <div id="meeting-screen">
+        <div id="main-content">
+            <div id="video-grid">
+                </div>
+            <div id="controls">
+                <button id="audio-toggle" class="on" onclick="toggleMedia('audio')">🎤 Mute</button>
+                <button id="video-toggle" class="on" onclick="toggleMedia('video')">📹 Stop Video</button>
+                <button style="background-color: #c0392b;" onclick="endCall()">Leave Meeting</button>
+            </div>
+        </div>
+        
+        <div id="sidebar">
+            <div id="chat-section">
+                </div>
+            <div id="participants-section">
+                <h3>Participants (<span id="participant-count">0</span>)</h3>
+                <ul id="participants-list">
+                    </ul>
+            </div>
+            <div id="chat-input-area">
+                <input type="text" id="chat-input" placeholder="Type a message...">
+                <button onclick="sendMessage()">Send</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- Global Variables ---
+        const socket = io();
+        let localStream = null;
+        let peerConnections = {}; // Key: remoteSocketId, Value: RTCPeerConnection
+        let localMediaState = { audio: true, video: true };
+        let localId = null;
+        let meetingRoomId = null;
+
+        const videoGrid = document.getElementById('video-grid');
+        const loginScreen = document.getElementById('login-screen');
+        const meetingScreen = document.getElementById('meeting-screen');
+        const errorMessage = document.getElementById('error-message');
+        
+        // --- 0. Initial Setup & Joining ---
+        async function joinMeeting() {
+            const roomID = document.getElementById('meetingId').value.trim();
+            const password = document.getElementById('meetingPassword').value.trim();
+            const userName = document.getElementById('userName').value.trim();
+
+            if (!roomID || !userName) {
+                errorMessage.textContent = "Meeting ID and Your Name are required.";
+                return;
+            }
+
+            try {
+                // 1. Get local media access first
+                localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                
+                // Add local video to the grid
+                addVideoElement(socket.id, userName, localStream, true);
+
+                // 2. Hide login and show meeting screen
+                loginScreen.style.display = 'none';
+                meetingScreen.style.display = 'grid';
+                meetingRoomId = roomID;
+                localId = socket.id;
+
+                // 3. Emit join-room event to the server
+                socket.emit('join-room', { roomID, password, userName });
+
+            } catch (error) {
+                errorMessage.textContent = `Error accessing media: ${error.message}. Please allow camera/mic.`;
+                console.error("Media access error:", error);
+            }
+        }
+
+        // --- 1. UI/Video Helper Functions ---
+        function addVideoElement(id, name, stream, isLocal = false) {
+            let container = document.getElementById(`video-${id}`);
+            if (!container) {
+                container = document.createElement('div');
+                container.id = `video-${id}`;
+                container.classList.add('video-container');
+                
+                const video = document.createElement('video');
+                video.autoplay = true;
+                if (isLocal) { video.muted = true; } // Mute local video
+                video.srcObject = stream;
+
+                const nameTag = document.createElement('div');
+                nameTag.classList.add('name-tag');
+                nameTag.textContent = `${name} ${isLocal ? '(You)' : ''}`;
+
+                container.appendChild(video);
+                container.appendChild(nameTag);
+                videoGrid.appendChild(container);
+            } else {
+                 // Update stream if container already exists (e.g., toggling)
+                 container.querySelector('video').srcObject = stream;
+            }
+        }
+        
+        function removeVideoElement(id) {
+            const container = document.getElementById(`video-${id}`);
+            if (container) {
+                container.remove();
+            }
+        }
+        
+        // --- 2. Media Controls ---
+        function toggleMedia(type) {
+            if (!localStream) return;
+            const track = localStream.getTracks().find(t => t.kind === type);
+            if (!track) return;
+            
+            const newState = !localMediaState[type];
+            track.enabled = newState;
+            localMediaState[type] = newState;
+
+            // Update UI button text
+            const button = document.getElementById(`${type}-toggle`);
+            if (type === 'audio') {
+                button.textContent = newState ? '🎤 Mute' : '🔇 Unmute';
+            } else {
+                button.textContent = newState ? '📹 Stop Video' : '▶️ Start Video';
+            }
+            button.classList.toggle('on', newState);
+
+            // Notify server and peers of the change
+            socket.emit('toggle-media', { type: type, state: newState });
+        }
+        
+        function endCall() {
+            // Close all peer connections
+            for (const id in peerConnections) {
+                peerConnections[id].close();
+            }
+            // Stop local tracks
+            localStream.getTracks().forEach(track => track.stop());
+            
+            // Reload page to return to login screen
+            window.location.reload();
+        }
+
+        // --- 3. Chat Functions ---
+        function sendMessage() {
+            const input = document.getElementById('chat-input');
+            const text = input.value.trim();
+            if (text) {
+                socket.emit('chat-message', text);
+                input.value = '';
+            }
+        }
+        
+        function displayMessage(data) {
+            const chatSection = document.getElementById('chat-section');
+            const p = document.createElement('p');
+            p.innerHTML = `<strong>${data.sender}:</strong> ${data.text}`;
+            chatSection.appendChild(p);
+            // Scroll to bottom
+            chatSection.scrollTop = chatSection.scrollHeight;
+        }
+
+
+        // --- 4. WebRTC Connection Management ---
+        const iceConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }; // STUN server only
+
+        function createPeerConnection(remoteID, isInitiator = false) {
+            const pc = new RTCPeerConnection(iceConfig);
+            peerConnections[remoteID] = pc;
+            
+            // 1. Add local stream to send
+            localStream.getTracks().forEach(track => {
+                pc.addTrack(track, localStream);
+            });
+            
+            // 2. Handle incoming stream
+            pc.ontrack = (event) => {
+                addVideoElement(remoteID, remoteID, event.streams[0]);
+            };
+            
+            // 3. Send ICE candidates (network info)
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    // Send candidate to remote peer via signaling server
+                    socket.emit('signal', {
+                        type: 'candidate',
+                        candidate: event.candidate,
+                        targetID: remoteID
+                    });
+                }
+            };
+            
+            // 4. Create Offer if initiating the call
+            if (isInitiator) {
+                pc.onnegotiationneeded = async () => {
+                    try {
+                        const offer = await pc.createOffer();
+                        await pc.setLocalDescription(offer);
+                        socket.emit('signal', {
+                            type: 'offer',
+                            sdp: pc.localDescription,
+                            targetID: remoteID
+                        });
+                    } catch (e) {
+                        console.error('Error creating offer:', e);
+                    }
+                };
+            }
+        }
+        
+        // --- 5. Socket.IO Event Handlers ---
+        
+        // Handle successful join
+        socket.on('joined-successfully', ({ roomID, name, chatHistory }) => {
+            console.log(`Joined room ${roomID} as ${name}`);
+            document.title = `Knights Meet - ${roomID}`;
+            
+            // Display chat history
+            chatHistory.forEach(displayMessage);
+        });
+
+        // Handle password error
+        socket.on('password-error', (message) => {
+            errorMessage.textContent = message;
+            meetingScreen.style.display = 'none';
+            loginScreen.style.display = 'flex';
+            // Stop local media if it was started
+            localStream.getTracks().forEach(track => track.stop());
+            localStream = null;
+        });
+
+        // A new user has joined the room
+        socket.on('user-joined', (newUser) => {
+            console.log('New user joined:', newUser.name, newUser.id);
+            // Create a new PeerConnection and initiate the call (send Offer)
+            createPeerConnection(newUser.id, true); 
+        });
+
+        // Receive signaling data (Offer, Answer, Candidate)
+        socket.on('signal', async (data) => {
+            const senderID = data.senderID;
+            
+            if (!peerConnections[senderID]) {
+                // If we don't have a connection, create one (this user is the Callee)
+                createPeerConnection(senderID, false);
+            }
+            const pc = peerConnections[senderID];
+            
+            try {
+                if (data.type === 'offer') {
+                    // Set remote description and create answer
+                    await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+                    
+                    const answer = await pc.createAnswer();
+                    await pc.setLocalDescription(answer);
+                    
+                    // Send answer back
+                    socket.emit('signal', {
+                        type: 'answer',
+                        sdp: pc.localDescription,
+                        targetID: senderID
+                    });
+                } else if (data.type === 'answer') {
+                    // Set remote description
+                    await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+                } else if (data.type === 'candidate') {
+                    // Add ICE candidate
+                    await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+                }
+            } catch (e) {
+                console.error(`Error processing signal from ${senderID}:`, e);
+            }
+        });
+        
+        // Update the list of participants
+        socket.on('participants-update', (participants) => {
+            const list = document.getElementById('participants-list');
+            list.innerHTML = '';
+            document.getElementById('participant-count').textContent = participants.length;
+
+            participants.forEach(p => {
+                const li = document.createElement('li');
+                const audioIcon = p.audio ? '🔊' : '🔇';
+                const videoIcon = p.video ? '🎥' : '❌';
+                
+                // Add an indicator for the local user
+                const isLocal = p.id === localId ? '(You)' : '';
+
+                li.innerHTML = `${audioIcon} ${videoIcon} <strong>${p.name}</strong> ${isLocal}`;
+                list.appendChild(li);
+            });
+        });
+
+        // A user toggled their media (used for visual feedback/mute icons)
+        socket.on('media-toggled', ({ id, type, state }) => {
+            console.log(`User ${id} toggled ${type} to ${state}`);
+            // In a full implementation, you'd update the remote video/audio elements here
+        });
+
+        // Handle incoming chat messages
+        socket.on('chat-message', displayMessage);
+
+        // A user left the meeting
+        socket.on('user-left', (id) => {
+            console.log(`User ${id} left the room.`);
+            if (peerConnections[id]) {
+                peerConnections[id].close();
+                delete peerConnections[id];
+            }
+            removeVideoElement(id);
+        });
+
+    </script>
+</body>
+</html>
