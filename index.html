@@ -32,7 +32,6 @@
         #participants-section { padding: 10px; border-top: 1px solid #444; }
         #participants-list { list-style: none; padding: 0; }
         #participants-list li { margin: 5px 0; display: flex; align-items: center; gap: 8px; font-size: 0.9em; }
-        .media-icon { width: 16px; height: 16px; }
         
     </style>
 </head>
@@ -67,7 +66,7 @@
                     </ul>
             </div>
             <div id="chat-input-area">
-                <input type="text" id="chat-input" placeholder="Type a message...">
+                <input type="text" id="chat-input" placeholder="Type a message..." onkeyup="if(event.key === 'Enter') sendMessage()">
                 <button onclick="sendMessage()">Send</button>
             </div>
         </div>
@@ -77,10 +76,9 @@
         // --- Global Variables ---
         const socket = io();
         let localStream = null;
-        let peerConnections = {}; // Key: remoteSocketId, Value: RTCPeerConnection
+        let peerConnections = {}; 
         let localMediaState = { audio: true, video: true };
         let localId = null;
-        let meetingRoomId = null;
 
         const videoGrid = document.getElementById('video-grid');
         const loginScreen = document.getElementById('login-screen');
@@ -108,7 +106,6 @@
                 // 2. Hide login and show meeting screen
                 loginScreen.style.display = 'none';
                 meetingScreen.style.display = 'grid';
-                meetingRoomId = roomID;
                 localId = socket.id;
 
                 // 3. Emit join-room event to the server
@@ -130,7 +127,7 @@
                 
                 const video = document.createElement('video');
                 video.autoplay = true;
-                if (isLocal) { video.muted = true; } // Mute local video
+                if (isLocal) { video.muted = true; } 
                 video.srcObject = stream;
 
                 const nameTag = document.createElement('div');
@@ -139,9 +136,14 @@
 
                 container.appendChild(video);
                 container.appendChild(nameTag);
-                videoGrid.appendChild(container);
+                
+                // Prepend local video to keep it first, append remote videos
+                if (isLocal) {
+                    videoGrid.prepend(container); 
+                } else {
+                    videoGrid.appendChild(container);
+                }
             } else {
-                 // Update stream if container already exists (e.g., toggling)
                  container.querySelector('video').srcObject = stream;
             }
         }
@@ -177,14 +179,10 @@
         }
         
         function endCall() {
-            // Close all peer connections
             for (const id in peerConnections) {
                 peerConnections[id].close();
             }
-            // Stop local tracks
             localStream.getTracks().forEach(track => track.stop());
-            
-            // Reload page to return to login screen
             window.location.reload();
         }
 
@@ -201,15 +199,14 @@
         function displayMessage(data) {
             const chatSection = document.getElementById('chat-section');
             const p = document.createElement('p');
-            p.innerHTML = `<strong>${data.sender}:</strong> ${data.text}`;
+            p.innerHTML = `<span style="color:#f39c12;">${data.sender} (${data.timestamp})</span>: ${data.text}`;
             chatSection.appendChild(p);
-            // Scroll to bottom
             chatSection.scrollTop = chatSection.scrollHeight;
         }
 
 
         // --- 4. WebRTC Connection Management ---
-        const iceConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }; // STUN server only
+        const iceConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }; // Use Google STUN
 
         function createPeerConnection(remoteID, isInitiator = false) {
             const pc = new RTCPeerConnection(iceConfig);
@@ -222,13 +219,14 @@
             
             // 2. Handle incoming stream
             pc.ontrack = (event) => {
-                addVideoElement(remoteID, remoteID, event.streams[0]);
+                const nameTag = document.getElementById('participants-list').querySelector(`[data-id="${remoteID}"] strong`);
+                const name = nameTag ? nameTag.textContent : remoteID;
+                addVideoElement(remoteID, name, event.streams[0]);
             };
             
             // 3. Send ICE candidates (network info)
             pc.onicecandidate = (event) => {
                 if (event.candidate) {
-                    // Send candidate to remote peer via signaling server
                     socket.emit('signal', {
                         type: 'candidate',
                         candidate: event.candidate,
@@ -237,7 +235,7 @@
                 }
             };
             
-            // 4. Create Offer if initiating the call
+            // 4. Create Offer if initiating the call (new user sees an existing one)
             if (isInitiator) {
                 pc.onnegotiationneeded = async () => {
                     try {
@@ -253,6 +251,7 @@
                     }
                 };
             }
+            return pc;
         }
         
         // --- 5. Socket.IO Event Handlers ---
@@ -261,9 +260,10 @@
         socket.on('joined-successfully', ({ roomID, name, chatHistory }) => {
             console.log(`Joined room ${roomID} as ${name}`);
             document.title = `Knights Meet - ${roomID}`;
-            
-            // Display chat history
             chatHistory.forEach(displayMessage);
+            
+            // Inform existing users in the room to start a call with the new user
+            socket.emit('ready');
         });
 
         // Handle password error
@@ -271,15 +271,14 @@
             errorMessage.textContent = message;
             meetingScreen.style.display = 'none';
             loginScreen.style.display = 'flex';
-            // Stop local media if it was started
-            localStream.getTracks().forEach(track => track.stop());
+            if(localStream) localStream.getTracks().forEach(track => track.stop());
             localStream = null;
         });
 
-        // A new user has joined the room
+        // A new user has joined the room (Existing users will create connections)
         socket.on('user-joined', (newUser) => {
             console.log('New user joined:', newUser.name, newUser.id);
-            // Create a new PeerConnection and initiate the call (send Offer)
+            // Initiate the call with the new user
             createPeerConnection(newUser.id, true); 
         });
 
@@ -288,30 +287,26 @@
             const senderID = data.senderID;
             
             if (!peerConnections[senderID]) {
-                // If we don't have a connection, create one (this user is the Callee)
+                // If we don't have a connection, create one (This handles the case where the sender is an existing user)
                 createPeerConnection(senderID, false);
             }
             const pc = peerConnections[senderID];
             
             try {
                 if (data.type === 'offer') {
-                    // Set remote description and create answer
                     await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
                     
                     const answer = await pc.createAnswer();
                     await pc.setLocalDescription(answer);
                     
-                    // Send answer back
                     socket.emit('signal', {
                         type: 'answer',
                         sdp: pc.localDescription,
                         targetID: senderID
                     });
                 } else if (data.type === 'answer') {
-                    // Set remote description
                     await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
                 } else if (data.type === 'candidate') {
-                    // Add ICE candidate
                     await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
                 }
             } catch (e) {
@@ -327,21 +322,23 @@
 
             participants.forEach(p => {
                 const li = document.createElement('li');
+                li.setAttribute('data-id', p.id);
                 const audioIcon = p.audio ? '🔊' : '🔇';
                 const videoIcon = p.video ? '🎥' : '❌';
                 
-                // Add an indicator for the local user
                 const isLocal = p.id === localId ? '(You)' : '';
 
                 li.innerHTML = `${audioIcon} ${videoIcon} <strong>${p.name}</strong> ${isLocal}`;
                 list.appendChild(li);
+                
+                // Handle video element visibility based on remote user's video state
+                const videoContainer = document.getElementById(`video-${p.id}`);
+                if (videoContainer) {
+                    videoContainer.style.display = p.video ? 'block' : 'none';
+                    // Mute/unmute remote audio track based on state
+                    videoContainer.querySelector('video').muted = !p.audio;
+                }
             });
-        });
-
-        // A user toggled their media (used for visual feedback/mute icons)
-        socket.on('media-toggled', ({ id, type, state }) => {
-            console.log(`User ${id} toggled ${type} to ${state}`);
-            // In a full implementation, you'd update the remote video/audio elements here
         });
 
         // Handle incoming chat messages
